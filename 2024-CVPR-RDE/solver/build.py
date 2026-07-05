@@ -61,6 +61,7 @@ def build_optimizer(args, model):
 
 
 def build_lr_scheduler(args, optimizer):
+    total_epochs = args.lr_total_epochs if getattr(args, "lr_total_epochs", -1) > 0 else args.num_epoch
     return LRSchedulerWithWarmup(
         optimizer,
         milestones=args.milestones,
@@ -68,7 +69,7 @@ def build_lr_scheduler(args, optimizer):
         warmup_factor=args.warmup_factor,
         warmup_epochs=args.warmup_epochs,
         warmup_method=args.warmup_method,
-        total_epochs=args.num_epoch,
+        total_epochs=total_epochs,
         mode=args.lrscheduler,
         target_lr=args.target_lr,
         power=args.power,

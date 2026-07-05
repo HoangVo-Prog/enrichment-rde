@@ -130,6 +130,8 @@ def get_args():
     
     ######################## scheduler ########################
     parser.add_argument("--num_epoch", type=int, default=60)
+    parser.add_argument("--lr_total_epochs", type=int, default=-1,
+                        help="epoch scale for LR scheduler; -1 follows num_epoch")
     parser.add_argument("--milestones", type=int, nargs='+', default=(20, 50))
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--warmup_factor", type=float, default=0.1)
