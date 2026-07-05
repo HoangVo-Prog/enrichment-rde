@@ -32,7 +32,7 @@ def set_seed(seed=0):
 
 if __name__ == '__main__':
     args = get_args()
-    set_seed(1+get_rank())
+    set_seed(args.seed+get_rank())
     name = args.name
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -75,7 +75,7 @@ if __name__ == '__main__':
 
     is_master = get_rank() == 0
     checkpointer = Checkpointer(model, optimizer, scheduler, args.output_dir, is_master)
-    evaluator = Evaluator(val_img_loader, val_txt_loader)
+    evaluator = Evaluator(val_img_loader, val_txt_loader, args)
 
     start_epoch = 1
     if args.resume:
@@ -98,5 +98,5 @@ if __name__ == '__main__':
             checkpointer = Checkpointer(model)
             checkpointer.load(f=op.join(args.output_dir, asss[i]))
             model = model.cuda()
-            do_inference(model, test_img_loader, test_txt_loader)
+            do_inference(model, test_img_loader, test_txt_loader, args, use_target_enrichment=getattr(args, "target_enrichment", False))
      

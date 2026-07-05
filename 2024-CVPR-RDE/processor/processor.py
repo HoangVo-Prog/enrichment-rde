@@ -12,6 +12,7 @@ from matplotlib import pyplot as plt
 from pylab import xticks,yticks,np
 from sklearn.metrics import confusion_matrix
 from sklearn.mixture import GaussianMixture
+from model.enrichment import TargetPoolManager
 
 
 ################### CODE FOR THE BETA MODEL  ########################
@@ -165,6 +166,11 @@ def get_loss(model, data_loader):
     return torch.Tensor(pred_A), torch.Tensor(pred_B)
 
 
+def _meter_value(value):
+    if torch.is_tensor(value):
+        return value.detach().item()
+    return float(value)
+
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
@@ -180,6 +186,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     logger = logging.getLogger("RDE.train")
     logger.info('start training')
+    target_pool = None
+    if getattr(args, "target_enrichment", False):
+        target_pool = TargetPoolManager(train_loader.dataset, args, logger)
 
     meters = {
         "loss": AverageMeter(),
@@ -189,6 +198,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
     }
+    if getattr(args, "target_enrichment", False):
+        meters["target_enrichment_loss"] = AverageMeter()
+        meters["target_retrieval_loss"] = AverageMeter()
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
@@ -206,28 +218,45 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         # data_size = train_loader.dataset.__len__()
         # pred_A, pred_B  =  torch.ones(data_size), torch.ones(data_size)
     
-        pred_A, pred_B = get_loss(model, train_loader)
-    
-        consensus_division = pred_A + pred_B # 0,1,2 
-        consensus_division[consensus_division==1] += torch.randint(0, 2, size=(((consensus_division==1)+0).sum(),))
-        label_hat = consensus_division.clone()
-        label_hat[consensus_division>1] = 1
-        label_hat[consensus_division<=1] = 0 
+        if getattr(args, "use_host_loss", True):
+            pred_A, pred_B = get_loss(model, train_loader)
+        
+            consensus_division = pred_A + pred_B # 0,1,2 
+            consensus_division[consensus_division==1] += torch.randint(0, 2, size=(((consensus_division==1)+0).sum(),))
+            label_hat = consensus_division.clone()
+            label_hat[consensus_division>1] = 1
+            label_hat[consensus_division<=1] = 0 
+        else:
+            label_hat = None
         
         model.train() 
         for n_iter, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            if getattr(args, "pnp_text_only", False):
+                batch = {k: (v if k == "images" else v.to(device)) for k, v in batch.items()}
+            else:
+                batch = {k: v.to(device) for k, v in batch.items()}
             index = batch['index']
             
-            batch['label_hat'] = label_hat[index.cpu()]
+            if label_hat is not None:
+                batch['label_hat'] = label_hat[index.cpu()]
  
-            ret = model(batch)
-            total_loss = sum([v for k, v in ret.items() if "loss" in k])
+            global_step = (epoch - 1) * len(train_loader) + n_iter + 1
+            target_cache = None
+            if target_pool is not None and epoch >= getattr(args, "enrichment_start", 1):
+                target_cache = target_pool.get_train_cache(model, batch, epoch, global_step)
+
+            ret = model(batch, epoch=epoch, current_step=global_step, target_cache=target_cache)
+            if target_cache is not None and "diagnostics" in target_cache:
+                ret.update(target_cache["diagnostics"])
+            total_loss = ret["loss"] if "loss" in ret else sum([v for k, v in ret.items() if "loss" in k])
 
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
-            meters['bge_loss'].update(ret.get('bge_loss', 0), batch_size)
-            meters['tse_loss'].update(ret.get('tse_loss', 0), batch_size)
+            meters['bge_loss'].update(_meter_value(ret.get('bge_loss', 0)), batch_size)
+            meters['tse_loss'].update(_meter_value(ret.get('tse_loss', 0)), batch_size)
+            if "target_enrichment_loss" in meters:
+                meters['target_enrichment_loss'].update(_meter_value(ret.get('target_enrichment_loss', 0)), batch_size)
+                meters['target_retrieval_loss'].update(_meter_value(ret.get('target_retrieval_loss', 0)), batch_size)
          
             optimizer.zero_grad()
             total_loss.backward()
@@ -278,10 +307,11 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     arguments["epoch"] = epoch
     checkpointer.save("last", **arguments)
                     
-def do_inference(model, test_img_loader, test_txt_loader):
+def do_inference(model, test_img_loader, test_txt_loader, args=None, use_target_enrichment=None):
 
     logger = logging.getLogger("RDE.test")
     logger.info("Enter inferencing")
 
-    evaluator = Evaluator(test_img_loader, test_txt_loader)
-    top1 = evaluator.eval(model.eval())
+    evaluator = Evaluator(test_img_loader, test_txt_loader, args)
+    top1 = evaluator.eval(model.eval(), use_target_enrichment=use_target_enrichment)
+    return top1

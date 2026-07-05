@@ -13,6 +13,56 @@ import torch.nn.functional as F
 import logging
 
 
+def _canonical_enrichment_space(space):
+    return "grab" if str(space).lower() == "tse" else str(space).lower()
+
+
+def _canonical_rank_space(space):
+    return "hybrid_global_grab" if str(space).lower() == "hybrid_global_tse" else str(space).lower()
+
+
+def _scale_scores_like(scores, reference, eps=1e-12):
+    score_min = scores.min(dim=1, keepdim=True).values
+    score_max = scores.max(dim=1, keepdim=True).values
+    ref_min = reference.min(dim=1, keepdim=True).values
+    ref_max = reference.max(dim=1, keepdim=True).values
+
+    score_range = (score_max - score_min).clamp_min(eps)
+    ref_range = ref_max - ref_min
+    return (scores - score_min) / score_range * ref_range + ref_min
+
+
+def _scaled_fuse(primary_scores, secondary_scores, primary_weight):
+    scaled_secondary = _scale_scores_like(secondary_scores, primary_scores)
+    return primary_weight * primary_scores + (1.0 - primary_weight) * scaled_secondary
+
+
+def _prototype_lambdas():
+    return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def _format_lambda(value):
+    if abs(value - round(value)) < 1e-12:
+        return str(int(round(value)))
+    return "{:.2f}".format(value).rstrip("0").rstrip(".")
+
+
+def _core_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _score_matrix(query_features, gallery_features, chunk_size=0):
+    if chunk_size is None or int(chunk_size) <= 0:
+        return query_features @ gallery_features.t()
+
+    chunks = []
+    chunk_size = int(chunk_size)
+    for start in range(0, query_features.shape[0], chunk_size):
+        query_chunk = query_features[start:start + chunk_size]
+        chunks.append(query_chunk @ gallery_features.t())
+    return torch.cat(chunks, dim=0)
+
+
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     if get_mAP:
         indices = torch.argsort(similarity, dim=1, descending=True)
@@ -55,10 +105,13 @@ def get_metrics(similarity, qids, gids, n_, retur_indices=False):
 
 
 class Evaluator():
-    def __init__(self, img_loader, txt_loader):
+    def __init__(self, img_loader, txt_loader, args=None):
         self.img_loader = img_loader # gallery
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("RDE.eval")
+        self.args = args
+        self.last_metrics = {}
+        self.last_best_task = None
 
     def _compute_embedding(self, model):
         model = model.eval()
@@ -111,17 +164,90 @@ class Evaluator():
         gids = torch.cat(gids, 0)
         gfeats = torch.cat(gfeats, 0) 
         return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
+
+    def _compute_target_gallery_cache(self, model):
+        model = model.eval()
+        core_model = _core_model(model)
+        device = next(core_model.parameters()).device
+        gids, cache_chunks = [], []
+
+        for pid, img in self.img_loader:
+            img = img.to(device)
+            with torch.no_grad():
+                cache = core_model.encode_target_image_cache(img)
+            gids.append(pid.view(-1))
+            cache_chunks.append({k: v.detach().cpu() for k, v in cache.items()})
+
+        if not cache_chunks:
+            raise ValueError("Cannot build target gallery cache from an empty image loader")
+
+        gids = torch.cat(gids, 0)
+        target_cache = {}
+        for key in cache_chunks[0].keys():
+            target_cache[key] = torch.cat([chunk[key] for chunk in cache_chunks], dim=0).to(device)
+        target_cache["pids"] = gids.to(device)
+        if hasattr(core_model, "finalize_target_cache"):
+            target_cache = core_model.finalize_target_cache(target_cache)
+        return target_cache, gids.cpu()
+
+    def _compute_enriched_text_embedding(self, model, target_cache):
+        model = model.eval()
+        core_model = _core_model(model)
+        device = next(core_model.parameters()).device
+
+        args = self.args
+        qids, qfeats = [], []
+        for pid, caption in self.txt_loader:
+            caption = caption.to(device)
+            with torch.no_grad():
+                host_text_feat = core_model.encode_text(caption)
+                grab_text_feat = None
+                if (
+                    _canonical_enrichment_space(getattr(args, "enrichment_space", "global")) == "grab"
+                    or _canonical_rank_space(getattr(args, "topm_rank_space", "host_global")) == "hybrid_global_grab"
+                ):
+                    grab_text_feat = core_model.encode_text_grab(caption)
+                if _canonical_enrichment_space(getattr(args, "enrichment_space", "global")) == "grab":
+                    query_feat = grab_text_feat
+                else:
+                    query_feat = host_text_feat
+                text_feat = core_model.enrich_text_features(
+                    query_feat,
+                    host_text_feat,
+                    target_cache,
+                    grab_text_features=grab_text_feat,
+                ).cpu()
+            qids.append(pid.view(-1))
+            qfeats.append(text_feat)
+
+        qids = torch.cat(qids, 0)
+        qfeats = torch.cat(qfeats, 0)
+        return qfeats.cpu(), qids.cpu()
+
+    def _target_eval_tasks(self, base_tasks, sims_target):
+        for proto_lambda in _prototype_lambdas():
+            proto_value = _format_lambda(proto_lambda)
+            for base_name, base_scores in base_tasks:
+                fused_name = "{}+proto({})".format(base_name, proto_value)
+                scaled_base_scores = _scale_scores_like(base_scores, sims_target)
+                yield fused_name, (
+                    (1.0 - proto_lambda) * scaled_base_scores
+                    + proto_lambda * sims_target
+                )
     
-    def eval(self, model, i2t_metric=False):
+    def eval(self, model, i2t_metric=False, use_target_enrichment=None):
+        if use_target_enrichment is None:
+            use_target_enrichment = bool(getattr(self.args, "target_enrichment", False)) if self.args is not None else False
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
         gfeats = F.normalize(gfeats, p=2, dim=1) # image features
-        sims_bse = qfeats @ gfeats.t()
+        score_chunk_size = getattr(self.args, "eval_score_chunk_size", 0) if self.args is not None else 0
+        sims_bse = _score_matrix(qfeats, gfeats, score_chunk_size)
   
         vq_feats, vg_feats, _, _ = self._compute_embedding_tse(model)
         vq_feats = F.normalize(vq_feats, p=2, dim=1) # text features
         vg_feats = F.normalize(vg_feats, p=2, dim=1) # image features
-        sims_tse = vq_feats@vg_feats.t()
+        sims_tse = _score_matrix(vq_feats, vg_feats, score_chunk_size)
         
         sims_dict = {
             'BGE': sims_bse,
@@ -129,23 +255,69 @@ class Evaluator():
             'BGE+TSE': (sims_bse+sims_tse)/2
         }
 
+        if use_target_enrichment:
+            if self.args is None:
+                raise ValueError("Target enrichment evaluation requires evaluator args")
+            core_model = _core_model(model)
+            if not hasattr(core_model, "target_enricher"):
+                raise ValueError("Target enrichment is enabled, but the model has no target_enricher module")
+            self.logger.info("Building target-aware cache from the evaluation gallery")
+            target_cache, target_gids = self._compute_target_gallery_cache(model)
+            target_qfeats, target_qids = self._compute_enriched_text_embedding(model, target_cache)
+            target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
+            target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
+            sims_target = _score_matrix(target_qfeats, target_gfeats, score_chunk_size)
+            qids = target_qids
+            gids = target_gids
+        else:
+            sims_target = None
+
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
+        top1 = 0
+        rows_by_task = {}
         
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
+            rows_by_task[key] = rs
+            top1 = max(top1, float(rs[1]))
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
+                table.add_row([f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]])
+
+        if sims_target is not None:
+            for key, sims in self._target_eval_tasks(list(sims_dict.items()), sims_target):
+                rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
+                table.add_row(rs)
+                rows_by_task[key] = rs
+                top1 = max(top1, float(rs[1]))
+                if i2t_metric:
+                    i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
+                    i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
+                    table.add_row([f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]])
+
+            target_key = "BGE+proto(1)"
+            if "BGE" in rows_by_task and target_key in rows_by_task:
+                base_row = rows_by_task["BGE"]
+                target_row = rows_by_task[target_key]
+                self.logger.info(
+                    "Target-aware delta vs BGE: R1 {:+.2f}, mAP {:+.2f}, mINP {:+.2f}".format(
+                        target_row[1] - base_row[1],
+                        target_row[4] - base_row[4],
+                        target_row[5] - base_row[5],
+                    )
+                )
 
         table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mAP"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
-        table.custom_format["RSum"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
         
-        return rs[1]
+        if sims_target is None:
+            return rs[1]
+        return top1
