@@ -4,6 +4,7 @@ import numpy as np
 import os
 import torch.nn.functional as F
 import logging
+import re
  
 from prettytable import PrettyTable
 import torch
@@ -102,6 +103,30 @@ def get_metrics(similarity, qids, gids, n_, retur_indices=False):
         return [n_, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_cmc[0]+ t2i_cmc[4]+ t2i_cmc[9]], indices
     else:
         return [n_, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_cmc[0]+ t2i_cmc[4]+ t2i_cmc[9]]
+
+
+def _metric_task_name(task):
+    task = str(task).replace("+", "_plus_")
+    task = task.replace("(", "_").replace(")", "")
+    task = task.replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_/-]+", "_", task).strip("_")
+
+
+def _row_to_eval_metrics(row):
+    task = _metric_task_name(row[0])
+    return {
+        f"eval/{task}/R1": float(row[1]),
+        f"eval/{task}/R5": float(row[2]),
+        f"eval/{task}/R10": float(row[3]),
+        f"eval/{task}/mAP": float(row[4]),
+        f"eval/{task}/mINP": float(row[5]),
+        f"eval/{task}/rSum": float(row[6]) if len(row) > 6 else 0.0,
+    }
+
+
+def _ablation_lambda_from_key(key):
+    match = re.search(r"\(([-+]?\d*\.?\d+)\)$", str(key))
+    return float(match.group(1)) if match else 0.0
 
 
 class Evaluator():
@@ -274,34 +299,60 @@ class Evaluator():
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
         top1 = 0
+        eval_metrics = {}
         rows_by_task = {}
+        best_task = None
+        best_row = None
+        best_ablation_task = None
+        best_ablation_row = None
         
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
             rows_by_task[key] = rs
-            top1 = max(top1, float(rs[1]))
+            eval_metrics.update(_row_to_eval_metrics(rs))
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                table.add_row([f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]])
+                i2t_row = [f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]]
+                table.add_row(i2t_row)
+                eval_metrics.update(_row_to_eval_metrics(i2t_row))
+
+            if best_row is None or rs[1] >= best_row[1]:
+                best_task = key
+                best_row = rs
 
         if sims_target is not None:
             for key, sims in self._target_eval_tasks(list(sims_dict.items()), sims_target):
                 rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
                 table.add_row(rs)
                 rows_by_task[key] = rs
-                top1 = max(top1, float(rs[1]))
+                eval_metrics.update(_row_to_eval_metrics(rs))
                 if i2t_metric:
                     i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                     i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                    table.add_row([f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]])
+                    i2t_row = [f'{key}-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]]
+                    table.add_row(i2t_row)
+                    eval_metrics.update(_row_to_eval_metrics(i2t_row))
+
+                if best_row is None or rs[1] >= best_row[1]:
+                    best_task = key
+                    best_row = rs
+                if "+proto(" in key and (best_ablation_row is None or rs[1] >= best_ablation_row[1]):
+                    best_ablation_task = key
+                    best_ablation_row = rs
 
             target_key = "BGE+proto(1)"
             if "BGE" in rows_by_task and target_key in rows_by_task:
                 base_row = rows_by_task["BGE"]
                 target_row = rows_by_task[target_key]
+                eval_metrics["eval/delta_R1_target_vs_BGE"] = float(target_row[1] - base_row[1])
+                eval_metrics["eval/delta_R5_target_vs_BGE"] = float(target_row[2] - base_row[2])
+                eval_metrics["eval/delta_R10_target_vs_BGE"] = float(target_row[3] - base_row[3])
+                eval_metrics["eval/delta_mAP_target_vs_BGE"] = float(target_row[4] - base_row[4])
+                eval_metrics["eval/delta_mINP_target_vs_BGE"] = float(target_row[5] - base_row[5])
+                eval_metrics["eval/delta_rSum_target_vs_BGE"] = float(target_row[6] - base_row[6])
                 self.logger.info(
                     "Target-aware delta vs BGE: R1 {:+.2f}, mAP {:+.2f}, mINP {:+.2f}".format(
                         target_row[1] - base_row[1],
@@ -310,6 +361,22 @@ class Evaluator():
                     )
                 )
 
+        if best_ablation_row is not None:
+            top1 = float(best_ablation_row[1])
+            best_task = best_ablation_task
+            eval_metrics["eval/ablation_best_R1"] = float(best_ablation_row[1])
+            eval_metrics["eval/ablation_best_R5"] = float(best_ablation_row[2])
+            eval_metrics["eval/ablation_best_R10"] = float(best_ablation_row[3])
+            eval_metrics["eval/ablation_best_mAP"] = float(best_ablation_row[4])
+            eval_metrics["eval/ablation_best_mINP"] = float(best_ablation_row[5])
+            eval_metrics["eval/ablation_best_rSum"] = float(best_ablation_row[6])
+            eval_metrics["eval/ablation_best_lambda"] = _ablation_lambda_from_key(best_ablation_task)
+        elif best_row is not None:
+            top1 = float(best_row[1])
+
+        self.last_metrics = eval_metrics
+        self.last_best_task = best_task
+
         table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
@@ -317,7 +384,7 @@ class Evaluator():
         table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
         table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
-        
-        if sims_target is None:
-            return rs[1]
+        self.logger.info('\n' + "best R1 = " + str(top1))
+        if best_task is not None:
+            self.logger.info("best R1 row = {}".format(best_task))
         return top1

@@ -2,6 +2,7 @@
 import logging
 import os
 from collections import OrderedDict
+from pathlib import Path
 
 import torch
 
@@ -71,10 +72,50 @@ class Checkpointer:
         return checkpoint
 
     def _load_file(self, f):
-        return torch.load(f, map_location=torch.device("cpu"))
+        try:
+            return torch.load(f, map_location=torch.device("cpu"))
+        except RuntimeError:
+            return torch.jit.load(f, map_location=torch.device("cpu")).state_dict()
 
     def _load_model(self, checkpoint, except_keys=None):
-        load_state_dict(self.model, checkpoint.pop("model"), except_keys)
+        state_dict = unwrap_checkpoint_state_dict(checkpoint)
+        load_state_dict(self.model, state_dict, except_keys)
+        if isinstance(checkpoint, dict):
+            checkpoint.pop("model", None)
+            checkpoint.pop("state_dict", None)
+
+
+def delete_output_checkpoints(output_dir, logger=None, pattern="*.pth"):
+    output_path = Path(output_dir)
+    if not output_path.is_dir():
+        if logger is not None:
+            logger.warning("Checkpoint cleanup skipped: {} is not a directory.".format(output_path))
+        return []
+
+    deleted_paths = []
+    for checkpoint_path in sorted(output_path.glob(pattern)):
+        if not checkpoint_path.is_file():
+            continue
+        try:
+            checkpoint_path.unlink()
+        except OSError as error:
+            if logger is not None:
+                logger.warning("Failed to delete checkpoint {}: {}".format(checkpoint_path, error))
+            continue
+        deleted_paths.append(checkpoint_path)
+
+    if logger is not None:
+        if deleted_paths:
+            logger.info(
+                "Deleted {} checkpoint(s) from {}: {}".format(
+                    len(deleted_paths),
+                    output_path,
+                    ", ".join(path.name for path in deleted_paths),
+                )
+            )
+        else:
+            logger.info("No checkpoints found to delete in {}.".format(output_path))
+    return deleted_paths
 
 
 def check_key(key, except_keys):
@@ -134,6 +175,15 @@ def strip_prefix_if_present(state_dict, prefix):
     for key, value in state_dict.items():
         stripped_state_dict[key.replace(prefix, "")] = value
     return stripped_state_dict
+
+
+def unwrap_checkpoint_state_dict(checkpoint):
+    for key in ("model", "state_dict"):
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get(key), dict):
+            return checkpoint[key]
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise TypeError("Checkpoint must be a state dict or contain a 'model'/'state_dict' entry")
 
 
 def load_state_dict(model, loaded_state_dict, except_keys=None):

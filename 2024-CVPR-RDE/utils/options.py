@@ -89,11 +89,15 @@ def get_args():
     parser.add_argument("--name", default="baseline", help="experiment name to save")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--output_dir", default="logs")
-    parser.add_argument("--log_period", default=100)
-    parser.add_argument("--eval_period", default=1)
+    parser.add_argument("--log_period", default=100, type=int)
+    parser.add_argument("--eval_period", default=1, type=int)
+    parser.add_argument("--eval_after_epoch", type=int, default=0,
+                        help="delay evaluation until this epoch finishes; 0 keeps the current behavior")
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--finetune_clip", type=str, default="",
+                        help="load compatible RDE/CLIP weights from a CLIP or RDE checkpoint")
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
@@ -150,6 +154,17 @@ def get_args():
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--test", dest='training', default=True, action='store_false')
+    wandb_group = parser.add_mutually_exclusive_group()
+    wandb_group.add_argument("--use_wandb", dest="use_wandb", action="store_true",
+                             help="enable automatic Weights & Biases logging")
+    wandb_group.add_argument("--no_wandb", dest="use_wandb", action="store_false",
+                             help="disable Weights & Biases logging")
+    parser.set_defaults(use_wandb=True)
+    parser.add_argument("--wandb_project", default="enrichment",
+                        help="Weights & Biases project name")
+    parser.add_argument("--delete_checkpoints_after_run", action="store_true", default=False,
+                        help="delete checkpoints produced in the run output directory after training finishes; "
+                             "when W&B is enabled, cleanup waits until checkpoint artifact upload succeeds")
 
     ######################## transductive enrichment ########################
     parser.add_argument("--target_enrichment", action='store_true',
@@ -221,6 +236,11 @@ def get_args():
 
     if args.seed < 0 or args.seed >= 2**32:
         parser.error("--seed must be in [0, 2**32)")
+    args.wandb_project = args.wandb_project.strip()
+    if not args.wandb_project:
+        parser.error("--wandb_project must not be empty")
+    if args.eval_after_epoch < 0:
+        parser.error("--eval_after_epoch must be a non-negative integer")
     if args.enrichment_start < 1:
         parser.error("--enrichment_start must be a positive integer")
     if args.top_m < 1:
