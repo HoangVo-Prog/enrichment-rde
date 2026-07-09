@@ -45,7 +45,8 @@ from diagnostic.constants import (
     UNIQUE_QUERY_CLUSTER_COLS,
 )
 from diagnostic.controls import construct_hardness_matched_controls
-from diagnostic.cue_cases import load_cases, select_queries_for_cases
+from diagnostic.cue_cases import generate_auto_cases, load_cases, select_queries_for_cases
+from diagnostic.cue_ontology import load_cue_specs
 from diagnostic.data_loading import QueryRecord, load_split, load_split_metadata
 from diagnostic.embeddings import extract_retriever_embeddings
 from diagnostic.gallery_construction import construct_cue_swap_galleries
@@ -397,25 +398,35 @@ def main() -> None:
         args.bootstrap_iters,
     )
 
-    cases = load_cases(args.cases_file)
-    case_candidate_rows = [
-        {
-            "case_id": case["case_id"],
-            "cue_a": case["cue_a"],
-            "cue_b": case["cue_b"],
-            "num_queries": len(case.get("query_ids", [])),
-            "query_ids": case.get("query_ids", ""),
-            "meets_min_queries": True,
-            "kept_after_support": True,
-            "reason": "",
-        }
-        for case in cases
-    ]
+    cue_specs = load_cue_specs(args.cue_vocab_file)
+    if args.auto_cases:
+        cases, case_candidate_rows, _ = generate_auto_cases(
+            split.query_records,
+            split.gallery_pids,
+            cue_specs,
+            args.min_queries_per_auto_case,
+            args.max_auto_cases,
+        )
+    else:
+        cases = load_cases(args.cases_file)
+        case_candidate_rows = [
+            {
+                "case_id": case["case_id"],
+                "cue_a": case["cue_a"],
+                "cue_b": case["cue_b"],
+                "num_queries": len(case.get("query_ids", [])),
+                "query_ids": case.get("query_ids", ""),
+                "meets_min_queries": True,
+                "kept_after_support": True,
+                "reason": "",
+            }
+            for case in cases
+        ]
     write_case_candidates(args.output_dir, case_candidate_rows)
     candidate_reason_counts = Counter(str(row.get("reason", "") or "kept") for row in case_candidate_rows)
     logger.info(
-        "Cue case source=%s candidates=%d retained=%d reason_counts=[%s]",
-        args.cases_file,
+        "Cue case generation mode=%s candidates=%d retained=%d reason_counts=[%s]",
+        "auto" if args.auto_cases else "manual",
         len(case_candidate_rows),
         len(cases),
         format_counts(candidate_reason_counts),

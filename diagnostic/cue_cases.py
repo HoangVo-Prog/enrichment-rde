@@ -1,16 +1,18 @@
-"""Manual cue-case handling without retrieval-outcome filtering."""
+"""Manual and automatic cue-case handling without retrieval-outcome filtering."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from diagnostic.cue_ontology import contains_normalized_phrase, normalize_text
+from diagnostic.cue_ontology import CueSpec, contains_normalized_phrase, detect_cues_in_query, normalize_text
 from diagnostic.data_loading import QueryRecord
 
 
@@ -74,6 +76,74 @@ def case_needles(case: Mapping[str, Any]) -> list[str]:
     else:
         needles = normalize_text(f"{case['cue_a']} {case['cue_b']}").split()
     return [needle for needle in needles if needle]
+
+
+def generate_auto_cases(
+    query_records: Sequence[QueryRecord],
+    gallery_pids: np.ndarray,
+    cue_specs: Sequence[CueSpec],
+    min_queries: int,
+    max_cases: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, list[str]]]:
+    pids_with_gallery = set(int(pid) for pid in gallery_pids.tolist())
+    detected_by_query = {
+        record.query_id: detect_cues_in_query(record.text, cue_specs)
+        for record in query_records
+    }
+    pair_to_query_ids: dict[tuple[str, str], list[int]] = {}
+    for record in query_records:
+        if int(record.pid) not in pids_with_gallery:
+            continue
+        cues = sorted(set(detected_by_query.get(record.query_id, [])))
+        for cue_a, cue_b in combinations(cues, 2):
+            pair_to_query_ids.setdefault(tuple(sorted((cue_a, cue_b))), []).append(record.query_id)
+
+    rows: list[dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
+    for (cue_a, cue_b), query_ids in pair_to_query_ids.items():
+        query_ids = sorted(set(int(query_id) for query_id in query_ids))
+        case_id = f"{_slug(cue_a)}__{_slug(cue_b)}"
+        supported = len(query_ids) >= min_queries
+        rows.append(
+            {
+                "case_id": case_id,
+                "cue_a": cue_a,
+                "cue_b": cue_b,
+                "num_queries": len(query_ids),
+                "query_ids": json.dumps(query_ids),
+                "meets_min_queries": supported,
+                "kept_after_support": supported,
+                "reason": "" if supported else "below_min_queries_per_auto_case",
+            }
+        )
+        if supported:
+            cases.append(
+                {
+                    "case_id": case_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    "query_ids": query_ids,
+                    "min_queries": min_queries,
+                    "selection_method": "pre_registered_auto",
+                    "auto_case_support": len(query_ids),
+                }
+            )
+    cases.sort(key=lambda case: (-int(case["auto_case_support"]), str(case["case_id"])))
+    if max_cases is not None:
+        kept = {str(case["case_id"]) for case in cases[:max_cases]}
+        cases = cases[:max_cases]
+        for row in rows:
+            if row["kept_after_support"] and row["case_id"] not in kept:
+                row["kept_after_support"] = False
+                row["reason"] = "capped_by_max_auto_cases"
+    rows.sort(key=lambda row: (-int(row["num_queries"]), str(row["case_id"])))
+    return cases, rows, detected_by_query
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", normalize_text(value))
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "cue"
 
 
 def _positive_lookahead_fragments(pattern: str) -> list[str] | None:

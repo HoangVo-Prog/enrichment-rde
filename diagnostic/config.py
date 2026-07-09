@@ -104,15 +104,17 @@ def parse_args() -> argparse.Namespace:
         "--cases_file",
         dest="cases_file",
         type=Path,
-        default=default_cue_cases_path(),
+        default=None,
     )
+    parser.add_argument("--auto_cases", action="store_true")
+    parser.add_argument("--cue_vocab_file", type=Path, default=None)
     parser.add_argument("--gallery_size", type=int, default=500)
     parser.add_argument("--dense_ratio", type=float, default=0.5)
     parser.add_argument("--num_trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--score_mode", choices=["auto", "global", "grab", "fusion"], default="auto")
-    parser.add_argument("--lambda_global", type=float, default=0.5)
+    parser.add_argument("--lambda_global", type=float, default=0.68)
     parser.add_argument("--lambda_contrast", type=float, default=0.5)
     parser.add_argument("--cue_threshold_quantile", type=float, default=0.75)
     parser.add_argument("--tau_density", type=float, default=0.02)
@@ -133,6 +135,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_galleries", action="store_true")
     parser.add_argument("--save_image_paths", action="store_true")
     parser.add_argument("--max_queries_per_case", type=int, default=None)
+    parser.add_argument("--min_queries_per_auto_case", type=int, default=10)
+    parser.add_argument("--max_auto_cases", type=int, default=None)
     parser.add_argument("--test_batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--neutral_strategy", choices=["low_affinity", "random"], default="low_affinity")
@@ -142,7 +146,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    for path_arg in ("retriever_config", "retriever_checkpoint", "cases_file"):
+    if args.cases_file is not None and args.auto_cases:
+        raise ValueError("Provide either --cases_file or --auto_cases, not both.")
+    if args.cases_file is None:
+        args.auto_cases = True
+    for path_arg in ("retriever_config", "retriever_checkpoint", "cases_file", "cue_vocab_file"):
         path = getattr(args, path_arg)
         if path is not None and not path.exists():
             raise FileNotFoundError(f"--{path_arg} does not exist: {path}")
