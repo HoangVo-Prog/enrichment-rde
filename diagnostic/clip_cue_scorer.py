@@ -22,6 +22,18 @@ class CueScorerOutput:
     affinities: dict[str, np.ndarray]
     prompts_by_cue: dict[str, list[str]]
 
+    @property
+    def scores(self) -> dict[str, np.ndarray]:
+        return self.affinities
+
+    @property
+    def prompts(self) -> dict[str, list[str]]:
+        return self.prompts_by_cue
+
+    @property
+    def image_features_shape(self) -> tuple[int, int]:
+        return (int(self.gallery_features.shape[0]), int(self.gallery_features.shape[1]))
+
 
 class OffTheShelfCLIPCueScorer:
     """Frozen CLIP scorer loaded without TBPS fine-tuned weights."""
@@ -34,7 +46,7 @@ class OffTheShelfCLIPCueScorer:
         logger: logging.Logger,
         prompt_templates: Sequence[str] = DEFAULT_PROMPT_TEMPLATES,
     ) -> None:
-        from model.clip_model import build_CLIP_from_openai_pretrained
+        from diagnostic.prototype_clip_model import build_CLIP_from_openai_pretrained
 
         self.model_name = model_name
         self.device = device
@@ -105,4 +117,3 @@ class OffTheShelfCLIPCueScorer:
             affinities=affinities,
             prompts_by_cue=prompts_by_cue,
         )
-
