@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -16,6 +15,8 @@ class GalleryBuild:
     galleries: dict[str, np.ndarray]
     dense: dict[str, np.ndarray]
     neutral: dict[str, np.ndarray]
+    shared_neutral: np.ndarray
+    positive_indices: np.ndarray
 
 
 def stable_topk(indices: np.ndarray, scores: np.ndarray, k: int, largest: bool = True) -> np.ndarray:
@@ -36,11 +37,12 @@ def choose_neutral_indices(
     rng: np.random.Generator,
     strategy: str,
     pool_factor: int,
+    insufficient_reason: str = "not_enough_remaining_for_neutral_fill",
 ) -> np.ndarray:
     if k <= 0:
         return np.asarray([], dtype=np.int64)
     if len(remaining) < k:
-        raise ValueError("not_enough_remaining_for_neutral_fill")
+        raise ValueError(insufficient_reason)
     if strategy == "random":
         pool = remaining
     elif strategy == "low_affinity":
@@ -75,6 +77,46 @@ def make_gallery(
     return gallery, dense, neutral
 
 
+def validate_shared_neutral_galleries(
+    *,
+    positive_indices: np.ndarray,
+    dense_a: np.ndarray,
+    dense_b: np.ndarray,
+    shared_neutral: np.ndarray,
+    gallery_a: np.ndarray,
+    gallery_b: np.ndarray,
+    gallery_size: int,
+    configured_dense_count: int,
+) -> None:
+    positive_set = set(int(index) for index in positive_indices.tolist())
+    dense_a_set = set(int(index) for index in dense_a.tolist())
+    dense_b_set = set(int(index) for index in dense_b.tolist())
+    shared_neutral_set = set(int(index) for index in shared_neutral.tolist())
+
+    if len(gallery_a) != gallery_size or len(gallery_b) != gallery_size:
+        raise ValueError("constructed_gallery_size_mismatch")
+    if len(dense_a) != configured_dense_count or len(dense_b) != configured_dense_count:
+        raise ValueError("constructed_dense_count_mismatch")
+    if len(np.unique(shared_neutral)) != len(shared_neutral):
+        raise ValueError("shared_neutral_contains_duplicate_image_ids")
+    if len(np.unique(gallery_a)) != len(gallery_a) or len(np.unique(gallery_b)) != len(gallery_b):
+        raise ValueError("gallery_contains_duplicate_image_ids")
+    if positive_set & dense_a_set or positive_set & dense_b_set or positive_set & shared_neutral_set:
+        raise ValueError("positive_image_in_distractor_set")
+    if (dense_a_set | dense_b_set) & shared_neutral_set:
+        raise ValueError("dense_image_in_shared_neutral")
+    if set(int(index) for index in gallery_a[: len(positive_indices)].tolist()) != positive_set:
+        raise ValueError("gallery_a_missing_complete_positive_set")
+    if set(int(index) for index in gallery_b[: len(positive_indices)].tolist()) != positive_set:
+        raise ValueError("gallery_b_missing_complete_positive_set")
+    if int(len(gallery_a) - len(positive_indices)) != int(len(gallery_b) - len(positive_indices)):
+        raise ValueError("gallery_distractor_count_mismatch")
+    if set(int(index) for index in gallery_a.tolist()) - positive_set - shared_neutral_set != dense_a_set:
+        raise ValueError("gallery_a_dense_set_mismatch")
+    if set(int(index) for index in gallery_b.tolist()) - positive_set - shared_neutral_set != dense_b_set:
+        raise ValueError("gallery_b_dense_set_mismatch")
+
+
 def construct_cue_swap_galleries(
     pid: int,
     gallery_pids: np.ndarray,
@@ -107,38 +149,43 @@ def construct_cue_swap_galleries(
     score_b_dense = psi_b - lambda_contrast * psi_a
 
     try:
-        gallery_a, dense_a, neutral_a = make_gallery(
-            positive_indices,
-            candidate_indices,
-            score_a_dense,
-            psi_a,
-            psi_b,
-            num_dense,
-            num_neutral,
-            np.random.default_rng(stable_seed(seed, case_id, query_id, trial_id, "a_dense")),
-            neutral_strategy,
-            neutral_pool_factor,
+        dense_a = stable_topk(candidate_indices, score_a_dense, num_dense, largest=True)
+        dense_b = stable_topk(candidate_indices, score_b_dense, num_dense, largest=True)
+        dense_union = set(int(index) for index in dense_a.tolist()) | set(int(index) for index in dense_b.tolist())
+        remaining = np.asarray(
+            [int(index) for index in candidate_indices.tolist() if int(index) not in dense_union],
+            dtype=np.int64,
         )
-        gallery_b, dense_b, neutral_b = make_gallery(
-            positive_indices,
-            candidate_indices,
-            score_b_dense,
+        shared_neutral = choose_neutral_indices(
+            remaining,
             psi_a,
             psi_b,
-            num_dense,
             num_neutral,
-            np.random.default_rng(stable_seed(seed, case_id, query_id, trial_id, "b_dense")),
+            np.random.default_rng(stable_seed(seed, case_id, query_id, trial_id, "shared_neutral")),
             neutral_strategy,
             neutral_pool_factor,
+            insufficient_reason="not_enough_remaining_for_shared_neutral_fill",
+        )
+        gallery_a = np.concatenate([positive_indices, dense_a, shared_neutral]).astype(np.int64)
+        gallery_b = np.concatenate([positive_indices, dense_b, shared_neutral]).astype(np.int64)
+        validate_shared_neutral_galleries(
+            positive_indices=positive_indices,
+            dense_a=dense_a,
+            dense_b=dense_b,
+            shared_neutral=shared_neutral,
+            gallery_a=gallery_a,
+            gallery_b=gallery_b,
+            gallery_size=gallery_size,
+            configured_dense_count=num_dense,
         )
     except ValueError as exc:
         return None, str(exc)
 
-    if len(gallery_a) != gallery_size or len(gallery_b) != gallery_size:
-        return None, "constructed_gallery_size_mismatch"
     return GalleryBuild(
         galleries={"a_dense": gallery_a, "b_dense": gallery_b},
         dense={"a_dense": dense_a, "b_dense": dense_b},
-        neutral={"a_dense": neutral_a, "b_dense": neutral_b},
+        neutral={"shared": shared_neutral, "a_dense": shared_neutral, "b_dense": shared_neutral},
+        shared_neutral=shared_neutral,
+        positive_indices=positive_indices,
     ), None
 

@@ -32,6 +32,8 @@ OUTPUT_FILES = {
     "summary_ci": "summary_with_ci.csv",
     "summary_ci_unique_query": "summary_with_ci_unique_query.csv",
     "summary_ci_case_query": "summary_with_ci_case_query.csv",
+    "hardness_audit_ci": "hardness_audit_with_ci.csv",
+    "tight_hardness_summary_ci": "tight_hardness_summary_with_ci.csv",
     "skipped": "skipped_queries.jsonl",
     "galleries": "galleries.jsonl",
 }
@@ -74,6 +76,10 @@ PER_GALLERY_COLUMNS = [
     "R10",
     "AP",
     "best_positive_rank",
+    "best_positive_score",
+    "max_negative_score",
+    "positive_negative_margin",
+    "negative_score_scale",
     "D_soft_a",
     "D_soft_b",
     "D_hard_a",
@@ -153,10 +159,38 @@ PAIRED_DELTA_COLUMNS = [
     "hm_ap_delta",
     "delta_ap_delta",
     "cue_shift",
+    "negative_score_scale",
+    "a_signed_max_negative_gap",
+    "b_signed_max_negative_gap",
+    "a_signed_margin_gap",
+    "b_signed_margin_gap",
+    "mean_signed_max_negative_gap",
+    "mean_signed_margin_gap",
+    "mean_abs_max_negative_gap",
+    "a_normalized_max_negative_gap",
+    "b_normalized_max_negative_gap",
+    "mean_normalized_max_negative_gap",
+    "max_abs_normalized_max_negative_gap",
+    "tight_hardness_match",
+    "tight_hardness_z_tolerance",
     "score_mode",
     "lambda_global",
     "seed",
 ]
+
+HARDNESS_AUDIT_METRICS = (
+    "mean_signed_max_negative_gap",
+    "mean_signed_margin_gap",
+    "mean_abs_max_negative_gap",
+    "mean_signed_normalized_max_negative_gap",
+    "mean_max_abs_normalized_max_negative_gap",
+)
+
+TIGHT_HARDNESS_METRICS = (
+    "r1_flip",
+    "hm_r1_flip",
+    "delta_r1_flip",
+)
 
 SUMMARY_CI_METRICS = (
     "r1_flip",
@@ -179,4 +213,19 @@ SUMMARY_CI_COLUMNS = [
     "unique_query_count",
     "case_query_count",
     "trial_count",
+]
+
+HARDNESS_AUDIT_COLUMNS = [
+    "retriever",
+    *SUMMARY_CI_COLUMNS,
+]
+
+TIGHT_HARDNESS_SUMMARY_COLUMNS = [
+    "retriever",
+    "tight_hardness_z_tolerance",
+    "tight_trial_count",
+    "tight_unique_query_count",
+    "tight_case_query_count",
+    "tight_trial_rate",
+    *SUMMARY_CI_COLUMNS,
 ]

@@ -28,6 +28,95 @@ def retrieval_metrics(scores: np.ndarray, is_positive: np.ndarray) -> Dict[str, 
     }
 
 
+def retriever_hardness_stats(scores: np.ndarray, is_positive: np.ndarray) -> Dict[str, float]:
+    if int(is_positive.sum()) == 0:
+        raise ValueError("retriever_hardness_stats called with no positive gallery item")
+    scores = np.asarray(scores, dtype=float)
+    is_positive = np.asarray(is_positive, dtype=bool)
+    positive_scores = scores[is_positive]
+    negative_scores = scores[~is_positive]
+    best_positive_score = float(np.max(positive_scores))
+    max_negative_score = float(np.max(negative_scores)) if len(negative_scores) else float("nan")
+    margin = best_positive_score - max_negative_score if np.isfinite(max_negative_score) else float("nan")
+    return {
+        "best_positive_score": best_positive_score,
+        "max_negative_score": max_negative_score,
+        "positive_negative_margin": float(margin),
+    }
+
+
+def query_negative_score_scale(
+    full_retriever_scores: np.ndarray,
+    full_gallery_pids: np.ndarray,
+    query_pid: int,
+) -> tuple[float, float]:
+    negative_scores = np.asarray(full_retriever_scores, dtype=float)[
+        np.asarray(full_gallery_pids) != int(query_pid)
+    ]
+    negative_score_scale = float(np.std(negative_scores, ddof=0)) if len(negative_scores) else float("nan")
+    safe_scale = max(negative_score_scale, 1e-12) if np.isfinite(negative_score_scale) else float("nan")
+    return negative_score_scale, float(safe_scale)
+
+
+def paired_hardness_gaps(
+    cue_metrics: Dict[str, Dict[str, float]],
+    hm_metrics: Dict[str, Dict[str, float]],
+    safe_scale: float,
+    tight_hardness_z_tolerance: float,
+) -> Dict[str, float | bool]:
+    a_signed_max_negative_gap = float(
+        cue_metrics["a_dense"]["max_negative_score"] - hm_metrics["hm_a"]["max_negative_score"]
+    )
+    b_signed_max_negative_gap = float(
+        cue_metrics["b_dense"]["max_negative_score"] - hm_metrics["hm_b"]["max_negative_score"]
+    )
+    a_signed_margin_gap = float(
+        cue_metrics["a_dense"]["positive_negative_margin"] - hm_metrics["hm_a"]["positive_negative_margin"]
+    )
+    b_signed_margin_gap = float(
+        cue_metrics["b_dense"]["positive_negative_margin"] - hm_metrics["hm_b"]["positive_negative_margin"]
+    )
+    mean_signed_max_negative_gap = 0.5 * (a_signed_max_negative_gap + b_signed_max_negative_gap)
+    mean_signed_margin_gap = 0.5 * (a_signed_margin_gap + b_signed_margin_gap)
+    mean_abs_max_negative_gap = 0.5 * (
+        abs(a_signed_max_negative_gap) + abs(b_signed_max_negative_gap)
+    )
+
+    if np.isfinite(safe_scale) and safe_scale > 0.0:
+        a_normalized_max_negative_gap = float(a_signed_max_negative_gap / safe_scale)
+        b_normalized_max_negative_gap = float(b_signed_max_negative_gap / safe_scale)
+    else:
+        a_normalized_max_negative_gap = float("nan")
+        b_normalized_max_negative_gap = float("nan")
+    max_abs_normalized = max(
+        abs(a_normalized_max_negative_gap),
+        abs(b_normalized_max_negative_gap),
+    )
+    mean_normalized_max_negative_gap = 0.5 * (
+        a_normalized_max_negative_gap + b_normalized_max_negative_gap
+    )
+    tight_hardness_match = bool(
+        np.isfinite(a_normalized_max_negative_gap)
+        and np.isfinite(b_normalized_max_negative_gap)
+        and abs(a_normalized_max_negative_gap) <= float(tight_hardness_z_tolerance)
+        and abs(b_normalized_max_negative_gap) <= float(tight_hardness_z_tolerance)
+    )
+    return {
+        "a_signed_max_negative_gap": float(a_signed_max_negative_gap),
+        "b_signed_max_negative_gap": float(b_signed_max_negative_gap),
+        "a_signed_margin_gap": float(a_signed_margin_gap),
+        "b_signed_margin_gap": float(b_signed_margin_gap),
+        "mean_signed_max_negative_gap": float(mean_signed_max_negative_gap),
+        "mean_signed_margin_gap": float(mean_signed_margin_gap),
+        "mean_abs_max_negative_gap": float(mean_abs_max_negative_gap),
+        "a_normalized_max_negative_gap": float(a_normalized_max_negative_gap),
+        "b_normalized_max_negative_gap": float(b_normalized_max_negative_gap),
+        "mean_normalized_max_negative_gap": float(mean_normalized_max_negative_gap),
+        "max_abs_normalized_max_negative_gap": float(max_abs_normalized),
+        "tight_hardness_match": tight_hardness_match,
+    }
+
+
 def sigmoid_np(values: np.ndarray) -> np.ndarray:
     values = np.clip(values, -60.0, 60.0)
     return 1.0 / (1.0 + np.exp(-values))

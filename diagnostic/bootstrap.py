@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Callable
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -41,6 +42,56 @@ def cluster_row_counts(df: pd.DataFrame, cluster_cols: Sequence[str]) -> pd.Data
     if df.empty:
         return pd.DataFrame(columns=list(cluster_cols) + ["row_count"])
     return df.groupby(list(cluster_cols), dropna=False).size().reset_index(name="row_count")
+
+
+def cluster_index_groups(df: pd.DataFrame, cluster_cols: Sequence[str]) -> list[np.ndarray]:
+    if df.empty:
+        return []
+    missing = set(cluster_cols) - set(df.columns)
+    if missing:
+        raise ValueError(f"Cluster index grouping missing cluster columns: {sorted(missing)}")
+    cluster_codes = df.groupby(list(cluster_cols), dropna=False).ngroup().to_numpy()
+    cluster_count = int(cluster_codes.max()) + 1 if len(cluster_codes) else 0
+    return [np.flatnonzero(cluster_codes == code).astype(np.int64) for code in range(cluster_count)]
+
+
+def concatenate_cluster_sample_indices(
+    index_groups: Sequence[np.ndarray],
+    sampled_cluster_ids: Sequence[int],
+) -> np.ndarray:
+    if len(sampled_cluster_ids) == 0:
+        return np.asarray([], dtype=np.int64)
+    return np.concatenate(
+        [np.asarray(index_groups[int(cluster_id)], dtype=np.int64) for cluster_id in sampled_cluster_ids]
+    ).astype(np.int64)
+
+
+def cluster_bootstrap_callback(
+    df: pd.DataFrame,
+    cluster_cols: Sequence[str],
+    iters: int,
+    seed: int,
+    statistic_fn: Callable[[pd.DataFrame], dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, int]]:
+    if df.empty:
+        count_summary = bootstrap_count_summary(df, cluster_cols)
+        return statistic_fn(df), [], count_summary
+    index_groups = cluster_index_groups(df, cluster_cols)
+    count_summary = bootstrap_count_summary(df, cluster_cols)
+    if not index_groups:
+        return statistic_fn(df.iloc[0:0].copy()), [], count_summary
+
+    point_estimate = statistic_fn(df)
+    rng = np.random.default_rng(seed)
+    bootstrap_stats: list[dict[str, Any]] = []
+    cluster_count = len(index_groups)
+    for _ in range(iters):
+        sampled_cluster_ids = rng.integers(0, cluster_count, size=cluster_count)
+        sample_indices = concatenate_cluster_sample_indices(index_groups, sampled_cluster_ids.tolist())
+        if len(sample_indices) == 0:
+            continue
+        bootstrap_stats.append(statistic_fn(df.iloc[sample_indices].copy()))
+    return point_estimate, bootstrap_stats, count_summary
 
 
 def cluster_bootstrap_ci(

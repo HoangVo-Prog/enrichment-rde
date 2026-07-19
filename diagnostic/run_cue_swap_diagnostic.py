@@ -24,7 +24,11 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(repo_root / "2024-CVPR-RDE"))
 
-from diagnostic.audit import log_validity_warnings
+from diagnostic.audit import (
+    build_hardness_audit_with_ci,
+    build_tight_hardness_summary_with_ci,
+    log_validity_warnings,
+)
 from diagnostic.bootstrap import bootstrap_count_summary, cluster_bootstrap_ci
 from diagnostic.clip_cue_scorer import OffTheShelfCLIPCueScorer
 from diagnostic.config import (
@@ -54,8 +58,11 @@ from diagnostic.metrics import (
     cue_shift,
     density_over_indices,
     gallery_distractor_indices,
+    paired_hardness_gaps,
     paired_metrics,
+    query_negative_score_scale,
     retrieval_metrics,
+    retriever_hardness_stats,
 )
 from diagnostic.outputs import (
     write_case_candidates,
@@ -160,9 +167,12 @@ def gallery_result_row(
     psi_b: np.ndarray,
     threshold_a: float,
     threshold_b: float,
+    negative_score_scale: float,
 ) -> tuple[dict[str, Any], dict[str, float], np.ndarray]:
     is_positive = gallery_pids[gallery_indices] == int(query.pid)
     metrics = retrieval_metrics(scores, is_positive)
+    hardness_stats = retriever_hardness_stats(scores, is_positive)
+    metrics_with_hardness = {**metrics, **hardness_stats}
     distractors = gallery_distractor_indices(gallery_indices, gallery_pids, query.pid)
     hard_a, soft_a = density_over_indices(psi_a, distractors, threshold_a, args.tau_density)
     hard_b, soft_b = density_over_indices(psi_b, distractors, threshold_b, args.tau_density)
@@ -185,6 +195,8 @@ def gallery_result_row(
         "num_distractors": int((~is_positive).sum()),
         "positive_ratio": float(is_positive.mean()),
         **metrics,
+        **hardness_stats,
+        "negative_score_scale": float(negative_score_scale),
         "D_soft_a": soft_a,
         "D_soft_b": soft_b,
         "D_hard_a": hard_a,
@@ -194,7 +206,7 @@ def gallery_result_row(
         "lambda_global": args.lambda_global,
         "seed": args.seed,
     }
-    return row, metrics, is_positive
+    return row, metrics_with_hardness, is_positive
 
 
 def precompute_selected_full_scores(
@@ -668,6 +680,11 @@ def main() -> None:
             if full_scores is None:
                 full_scores = full_query_scores(retriever_cache, query_id, score_mode, args.lambda_global)
                 full_score_cache[query_id] = full_scores
+            negative_score_scale, safe_negative_score_scale = query_negative_score_scale(
+                full_scores,
+                split.gallery_pids,
+                query.pid,
+            )
             hm_build, hm_skip = construct_hardness_matched_controls(
                 query.pid,
                 build.galleries,
@@ -705,6 +722,7 @@ def main() -> None:
                     psi_b=psi_b,
                     threshold_a=threshold_a,
                     threshold_b=threshold_b,
+                    negative_score_scale=negative_score_scale,
                 )
                 per_gallery_rows.append(row)
                 cue_metrics[gallery_type] = metrics
@@ -730,12 +748,19 @@ def main() -> None:
                     psi_b=psi_b,
                     threshold_a=threshold_a,
                     threshold_b=threshold_b,
+                    negative_score_scale=negative_score_scale,
                 )
                 per_gallery_rows.append(row)
                 hm_metrics[gallery_type] = metrics
 
             cue_pair = paired_metrics(cue_metrics["a_dense"], cue_metrics["b_dense"])
             hm_pair = paired_metrics(hm_metrics["hm_a"], hm_metrics["hm_b"])
+            hardness_gap_info = paired_hardness_gaps(
+                cue_metrics,
+                hm_metrics,
+                safe_negative_score_scale,
+                args.tight_hardness_z_tolerance,
+            )
             paired_cue_rows.append(
                 {
                     "dataset": args.dataset,
@@ -799,6 +824,9 @@ def main() -> None:
                     "hm_ap_delta": hm_pair["ap_delta"],
                     "delta_ap_delta": cue_pair["ap_delta"] - hm_pair["ap_delta"],
                     "cue_shift": shift_info["cue_shift"],
+                    "negative_score_scale": negative_score_scale,
+                    **hardness_gap_info,
+                    "tight_hardness_z_tolerance": args.tight_hardness_z_tolerance,
                     "score_mode": score_mode,
                     "lambda_global": args.lambda_global,
                     "seed": args.seed,
@@ -816,8 +844,22 @@ def main() -> None:
                         "gallery_type": gallery_type,
                         "image_ids": gallery_indices.astype(int).tolist(),
                     }
+                    if gallery_type in build.galleries:
+                        gallery_row["positive_indices"] = build.positive_indices.astype(int).tolist()
+                        gallery_row["dense_indices"] = build.dense[gallery_type].astype(int).tolist()
+                        gallery_row["shared_neutral_indices"] = build.shared_neutral.astype(int).tolist()
                     if args.save_image_paths:
                         gallery_row["image_paths"] = [split.gallery_paths[int(index)] for index in gallery_indices]
+                        if gallery_type in build.galleries:
+                            gallery_row["positive_image_paths"] = [
+                                split.gallery_paths[int(index)] for index in build.positive_indices
+                            ]
+                            gallery_row["dense_image_paths"] = [
+                                split.gallery_paths[int(index)] for index in build.dense[gallery_type]
+                            ]
+                            gallery_row["shared_neutral_image_paths"] = [
+                                split.gallery_paths[int(index)] for index in build.shared_neutral
+                            ]
                     gallery_rows.append(gallery_row)
 
         if selected_index == 1 or selected_index % 50 == 0 or selected_index == len(selected_queries):
@@ -972,6 +1014,25 @@ def main() -> None:
         pd.DataFrame(columns=SUMMARY_CI_COLUMNS),
     )
     logger.info("Primary CI output uses bootstrap_unit=%s", primary_unit)
+    hardness_audit_ci = build_hardness_audit_with_ci(
+        paired_delta_df,
+        bootstrap_iters=args.bootstrap_iters,
+        bootstrap_seed=args.bootstrap_seed,
+        retriever_name=args.retriever_name,
+    )
+    tight_hardness_summary_ci = build_tight_hardness_summary_with_ci(
+        paired_delta_df,
+        retriever_name=args.retriever_name,
+        tight_hardness_z_tolerance=args.tight_hardness_z_tolerance,
+        bootstrap_iters=args.bootstrap_iters,
+        bootstrap_seed=args.bootstrap_seed,
+    )
+    logger.info(
+        "Hardness audit summaries built rows=%d tight_rows=%d tolerance=%.4f",
+        len(hardness_audit_ci),
+        len(tight_hardness_summary_ci),
+        args.tight_hardness_z_tolerance,
+    )
     write_started = time.perf_counter()
     write_run_outputs(
         args.output_dir,
@@ -986,6 +1047,8 @@ def main() -> None:
         summary_overall,
         summary_ci,
         summary_ci_by_unit,
+        hardness_audit_ci,
+        tight_hardness_summary_ci,
         skipped_rows,
         gallery_rows,
         args.save_galleries,

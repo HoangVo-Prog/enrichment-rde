@@ -141,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--neutral_strategy", choices=["low_affinity", "random"], default="low_affinity")
     parser.add_argument("--neutral_pool_factor", type=int, default=5)
+    parser.add_argument("--tight_hardness_z_tolerance", type=float, default=0.10)
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
 
@@ -172,6 +173,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--bootstrap_iters must be positive")
     if args.neutral_pool_factor <= 0:
         raise ValueError("--neutral_pool_factor must be positive")
+    if args.tight_hardness_z_tolerance < 0:
+        raise ValueError("--tight_hardness_z_tolerance must be non-negative")
     if args.enable_random_control:
         raise NotImplementedError(
             "--enable_random_control is reserved for a future random replacement control. "
