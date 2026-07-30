@@ -409,6 +409,47 @@ def maybe_record_override(overrides: List[Dict[str, Any]], name: str, value: Any
         overrides.append({"name": name, "source": "cli", "value": _json_safe(value), "config_value": _json_safe(config_value)})
 
 
+def normalize_rde_loss_names_for_eval(
+    args: SimpleNamespace,
+    gate_config_values: Mapping[str, Any],
+    overrides: List[Dict[str, Any]],
+) -> None:
+    """Avoid RDE model/build.py's silent exit() on inherited IRRA loss defaults."""
+    raw_loss_names = str(getattr(args, "loss_names", "") or "")
+    tasks = [task.strip() for task in raw_loss_names.split("+") if task.strip()]
+    valid_by_lower = {
+        "tal": "TAL",
+        "trl": "TRL",
+        "infonce": "InfoNCE",
+        "sdm": "SDM",
+    }
+    for task in tasks:
+        canonical = valid_by_lower.get(task.lower())
+        if canonical is not None:
+            if raw_loss_names != canonical:
+                overrides.append(
+                    {
+                        "name": "loss_names",
+                        "source": "rde_eval_compatibility",
+                        "value": canonical,
+                        "config_value": _json_safe(gate_config_values.get("loss_names")),
+                        "previous_value": raw_loss_names,
+                        "reason": (
+                            "RDE model construction accepts TAL/TRL/InfoNCE/SDM and otherwise calls exit(); "
+                            "qualitative evaluation uses encoders only, so a compatible RDE loss selector is sufficient."
+                        ),
+                    }
+                )
+                _log("RDE eval compatibility: normalized loss_names from {!r} to {!r}".format(raw_loss_names, canonical))
+            args.loss_names = canonical
+            return
+    raise ValueError(
+        "RDE backbone requires loss_names containing one of TAL, TRL, InfoNCE, or SDM. "
+        "Resolved loss_names={!r}. This usually means the provided base checkpoint/config is not an RDE run; "
+        "check --base_checkpoint and --gate_config.".format(raw_loss_names)
+    )
+
+
 def prepare_output_dir(output_dir: Path, overwrite: bool, save_json_rows: bool) -> Path:
     generated = [
         output_dir / "combination_results.csv",
@@ -2042,6 +2083,7 @@ def main() -> None:
     args.gate_checkpoint = str(gate_checkpoint)
     args.eval_output_dir = str(output_dir)
     _ensure_eval_defaults(args, spec, common_cli)
+    normalize_rde_loss_names_for_eval(args, gate_config_values, overrides)
 
     if cli_args.seed is not None:
         maybe_record_override(overrides, "seed", cli_args.seed, getattr(args, "seed", None))
